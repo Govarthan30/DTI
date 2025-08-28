@@ -10,6 +10,8 @@ const qrcode = require("qrcode");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcrypt");
 const cron = require("node-cron");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());
@@ -22,6 +24,10 @@ const MAIL_USER = process.env.MAIL_USER;
 const MAIL_PASS = process.env.MAIL_PASS;
 const JWT_SECRET = process.env.JWT_SECRET || "change_this_secret";
 const HARDWARE_KEY = process.env.HARDWARE_KEY || "change_this_hardware_key";
+const TOKEN_SIGN_KEY = process.env.TOKEN_SIGN_KEY || "change_this_token_sign_key";
+
+// local file path for downloadable snapshot
+const TOKENS_FILE_PATH = path.join(__dirname, "tokens.json");
 
 // check env
 if (!MONGO_URI) {
@@ -30,6 +36,12 @@ if (!MONGO_URI) {
 }
 if (!MAIL_USER || !MAIL_PASS) {
   console.warn("MAIL_USER / MAIL_PASS not set — OTP emails will fail.");
+}
+if (!HARDWARE_KEY) {
+  console.warn("HARDWARE_KEY not set — hardware endpoints will be insecure in prod.");
+}
+if (!TOKEN_SIGN_KEY) {
+  console.warn("TOKEN_SIGN_KEY not set — token signatures use default key (insecure for prod).");
 }
 
 // ---------- connect mongo ----------
@@ -104,13 +116,63 @@ function authMiddleware(req, res, next) {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
+function requireHardwareKey(req, res) {
+  const key = req.headers["x-hardware-key"];
+  if (!key || key !== HARDWARE_KEY) {
+    res.status(401).json({ error: "invalid hardware key" });
+    return null;
+  }
+  return true;
+}
+
+// HMAC signer for a token entry (fields must match exactly on client verify)
+function signTokenEntry({ publicRef, expiresAt, createdAt }) {
+  const payload = `${publicRef}|${new Date(expiresAt).toISOString()}|${new Date(createdAt).toISOString()}`;
+  return crypto.createHmac("sha256", TOKEN_SIGN_KEY).update(payload).digest("hex");
+}
+
+// Build the in-memory list of active token entries with signatures
+async function buildActiveTokenEntries(limit = null) {
+  const now = new Date();
+  let q = Order.find({ used: false, expiresAt: { $gt: now } })
+    .select("publicRef expiresAt createdAt userEmail items total")
+    .sort({ createdAt: -1 });
+  if (limit && Number.isInteger(limit) && limit > 0) q = q.limit(limit);
+
+  const docs = await q.lean();
+  return docs.map(d => {
+    const entry = {
+      publicRef: d.publicRef,
+      // NOTE: for offline trust you can omit secretToken from snapshot.
+      // If you need stronger offline auth, include a masked/hashed token.
+      expiresAt: d.expiresAt,
+      createdAt: d.createdAt,
+      userEmail: d.userEmail,
+      items: d.items,
+      total: d.total,
+    };
+    return { ...entry, signature: signTokenEntry(entry) };
+  });
+}
+
+// Write snapshot file to disk (so hardware can download)
+async function updateTokensFile(limit = null) {
+  const tokens = await buildActiveTokenEntries(limit);
+  const snapshot = {
+    generatedAt: new Date().toISOString(),
+    count: tokens.length,
+    tokens,
+  };
+  fs.writeFileSync(TOKENS_FILE_PATH, JSON.stringify(snapshot, null, 2));
+  return snapshot;
+}
 
 // ---------- ROUTES ----------
 
 // health
 app.get("/", (req, res) => res.json({ ok: true }));
 
-// 1) Signup: create user with email+password and send OTP
+// 1) Signup
 app.post("/api/auth/signup", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -123,9 +185,8 @@ app.post("/api/auth/signup", async (req, res) => {
     const otp = String(Math.floor(100000 + Math.random() * 900000));
     const otpExpiresAt = nowPlusMinutes(10);
 
-    const user = await User.create({ email, passwordHash, otp, otpExpiresAt, verified: false });
+    await User.create({ email, passwordHash, otp, otpExpiresAt, verified: false });
 
-    // send OTP email (best-effort)
     if (MAIL_USER && MAIL_PASS) {
       transporter.sendMail({
         from: MAIL_USER,
@@ -142,7 +203,7 @@ app.post("/api/auth/signup", async (req, res) => {
   }
 });
 
-// 2) Verify OTP -> activate account & return JWT
+// 2) Verify OTP
 app.post("/api/auth/verify-otp", async (req, res) => {
   try {
     const { email, otp } = req.body;
@@ -172,7 +233,7 @@ app.post("/api/auth/verify-otp", async (req, res) => {
   }
 });
 
-// 3) Login with email+password (requires verified)
+// 3) Login
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -194,7 +255,7 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-// 4) Send OTP again (for recovery)
+// 4) Resend OTP
 app.post("/api/auth/resend-otp", async (req, res) => {
   try {
     const { email } = req.body;
@@ -224,7 +285,8 @@ app.post("/api/auth/resend-otp", async (req, res) => {
   }
 });
 
-// 5) Create order (user must be authenticated). This marks paid = true per your flow.
+// 5) Create order
+// 5) Create order
 app.post("/api/orders", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -236,10 +298,8 @@ app.post("/api/orders", authMiddleware, async (req, res) => {
 
     const total = items.reduce((s, it) => s + (it.price || 0) * (it.qty || 1), 0);
 
-    // Create secure token + public ref
     const secretToken = genSecret(32);
     let publicRef;
-    // ensure unique publicRef
     do {
       publicRef = genRef(10);
     } while (await Order.findOne({ publicRef }));
@@ -251,7 +311,7 @@ app.post("/api/orders", authMiddleware, async (req, res) => {
       userEmail,
       items,
       total,
-      paid: true, // per your flow
+      paid: true,
       publicRef,
       secretToken,
       expiresAt,
@@ -260,6 +320,37 @@ app.post("/api/orders", authMiddleware, async (req, res) => {
     // QR contains only the public ref JSON
     const qrPayload = JSON.stringify({ ref: publicRef });
     const qrDataUrl = await qrcode.toDataURL(qrPayload);
+
+    // OPTIONAL: refresh snapshot so hardware can pull immediately
+    try { await updateTokensFile(); } catch (e) { console.warn("snapshot refresh failed:", e.message); }
+
+    // 📧 Send mail with QR
+    if (MAIL_USER && MAIL_PASS) {
+      const mailOptions = {
+        from: MAIL_USER,
+        to: userEmail,
+        subject: "Your QuickServe Order QR Code",
+        html: `
+          <p>Thank you for your order 🎉</p>
+          <p>Order Ref: <b>${publicRef}</b></p>
+          <p>Total: ₹${total}</p>
+          <p>This QR code is valid until <b>${expiresAt.toLocaleString()}</b></p>
+          <p><img src="cid:orderqr" alt="QR Code" /></p>
+        `,
+        attachments: [
+          {
+            filename: `order-${publicRef}.png`,
+            content: qrDataUrl.split("base64,")[1],
+            encoding: "base64",
+            cid: "orderqr" // embed inline in HTML
+          }
+        ],
+      };
+
+      transporter.sendMail(mailOptions).catch(err => {
+        console.error("QR mail send error:", err.message);
+      });
+    }
 
     return res.json({
       message: "order created",
@@ -273,6 +364,7 @@ app.post("/api/orders", authMiddleware, async (req, res) => {
     return res.status(500).json({ error: "server error" });
   }
 });
+
 
 // 6) Get user's order history
 app.get("/api/orders/history", authMiddleware, async (req, res) => {
@@ -301,65 +393,127 @@ app.get("/api/orders/:orderId", authMiddleware, async (req, res) => {
   }
 });
 
-// 8) Hardware sync: returns active tokens (secretToken + ref + order data) — protected by HARDWARE_KEY header
+// 8) Hardware sync (JSON, non-file) — includes signatures
 app.get("/api/hardware/sync", async (req, res) => {
   try {
-    const key = req.headers["x-hardware-key"];
-    if (!key || key !== HARDWARE_KEY) return res.status(401).json({ error: "invalid hardware key" });
-
-    const now = new Date();
-    const tokens = await Order.find({
-      used: false,
-      expiresAt: { $gt: now },
-    }).select("publicRef secretToken expiresAt userEmail items total createdAt").lean();
-
-    // return tokens for hardware to cache locally
-    return res.json({ tokens });
+    if (!requireHardwareKey(req, res)) return;
+    const limit = parseInt(req.query.limit || "", 10);
+    const tokens = await buildActiveTokenEntries(Number.isInteger(limit) ? limit : null);
+    return res.json({ generatedAt: new Date().toISOString(), tokens });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "server error" });
   }
 });
 
-// 9) Hardware redeem: validate ref + secretToken (or online verification), mark used and return order
+// 8b) Hardware snapshot file (downloadable tokens.json)
+app.get("/api/hardware/tokens-file", async (req, res) => {
+  try {
+    if (!requireHardwareKey(req, res)) return;
+    const limit = parseInt(req.query.limit || "", 10);
+    await updateTokensFile(Number.isInteger(limit) ? limit : null);
+    res.download(TOKENS_FILE_PATH, "tokens.json");
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "server error" });
+  }
+});
+
+// 9) Hardware redeem (online, strict) — requires secretToken
+// 9) Hardware redeem (hybrid: online DB, fallback to tokens.json)
 app.post("/api/hardware/redeem", async (req, res) => {
   try {
     const { ref, secretToken } = req.body;
     if (!ref) return res.status(400).json({ error: "ref required" });
 
-    const tokenDoc = await Order.findOne({ publicRef: ref });
-    if (!tokenDoc) return res.status(404).json({ error: "ref not found" });
-    if (tokenDoc.used) return res.status(409).json({ error: "token already used" });
-    if (new Date() > tokenDoc.expiresAt) return res.status(410).json({ error: "token expired" });
-
-    if (secretToken) {
-      if (secretToken !== tokenDoc.secretToken) return res.status(401).json({ error: "invalid secret token" });
-    } else {
-      // if no secretToken provided, optionally allow (less secure) — here we require secretToken for hardware redeem
-      return res.status(400).json({ error: "secretToken required" });
+    try {
+      // --- Online mode (MongoDB) ---
+      const tokenDoc = await Order.findOne({ publicRef: ref });
+      if (tokenDoc) {
+        if (tokenDoc.used) return res.status(409).json({ error: "token already used" });
+        if (new Date() > tokenDoc.expiresAt) return res.status(410).json({ error: "token expired" });
+        if (!secretToken || secretToken !== tokenDoc.secretToken) {
+          return res.status(401).json({ error: "invalid secretToken" });
+        }
+        tokenDoc.used = true;
+        await tokenDoc.save();
+        try { await updateTokensFile(); } catch (e) {}
+        return res.json({ message: "valid (DB)", order: { id: tokenDoc._id, items: tokenDoc.items, total: tokenDoc.total } });
+      }
+    } catch (dbErr) {
+      console.warn("⚠️ DB offline, falling back to JSON:", dbErr.message);
     }
 
-    // mark used and respond with order details
-    tokenDoc.used = true;
-    await tokenDoc.save();
+    // --- Offline mode (tokens.json) ---
+    if (!fs.existsSync(TOKENS_FILE_PATH)) {
+      return res.status(503).json({ error: "offline snapshot not available" });
+    }
+    const snapshot = JSON.parse(fs.readFileSync(TOKENS_FILE_PATH));
+    const token = snapshot.tokens.find(t => t.publicRef === ref);
+    if (!token) return res.status(404).json({ error: "ref not found in snapshot" });
+    if (new Date() > new Date(token.expiresAt)) return res.status(410).json({ error: "token expired" });
 
-    return res.json({
-      message: "valid",
-      order: {
-        id: tokenDoc._id,
-        userEmail: tokenDoc.userEmail,
-        items: tokenDoc.items,
-        total: tokenDoc.total,
-        createdAt: tokenDoc.createdAt,
-      },
-    });
+    const expectedSig = signTokenEntry(token);
+    if (expectedSig !== token.signature) return res.status(401).json({ error: "signature mismatch" });
+
+    return res.json({ message: "valid (offline json)", token });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "server error" });
   }
 });
 
-// 10) Admin export orders as CSV (basic) — no auth added here; in production add admin auth
+// 9b) Hardware bulk-redeem (OFFLINE SYNC) — trusts hardware key
+// Body: { refs: ["ABC123", "XYZ999", ...] }
+// 9b) Hardware bulk-redeem (hybrid: online DB, fallback to tokens.json)
+app.post("/api/hardware/bulk-redeem", async (req, res) => {
+  try {
+    if (!requireHardwareKey(req, res)) return;
+    const { refs } = req.body;
+    if (!Array.isArray(refs) || refs.length === 0) {
+      return res.status(400).json({ error: "refs[] required" });
+    }
+
+    const results = [];
+    try {
+      // --- Online mode ---
+      for (const ref of refs) {
+        const doc = await Order.findOne({ publicRef: ref });
+        if (!doc) { results.push({ ref, status: "not_found" }); continue; }
+        if (doc.used) { results.push({ ref, status: "already_used" }); continue; }
+        if (new Date() > doc.expiresAt) { results.push({ ref, status: "expired" }); continue; }
+        doc.used = true;
+        await doc.save();
+        results.push({ ref, status: "marked_used" });
+      }
+      try { await updateTokensFile(); } catch (e) {}
+      return res.json({ mode: "db", results });
+    } catch (dbErr) {
+      console.warn("⚠️ DB offline, bulk fallback to JSON:", dbErr.message);
+    }
+
+    // --- Offline mode ---
+    if (!fs.existsSync(TOKENS_FILE_PATH)) {
+      return res.status(503).json({ error: "offline snapshot not available" });
+    }
+    const snapshot = JSON.parse(fs.readFileSync(TOKENS_FILE_PATH));
+    for (const ref of refs) {
+      const token = snapshot.tokens.find(t => t.publicRef === ref);
+      if (!token) { results.push({ ref, status: "not_found" }); continue; }
+      if (new Date() > new Date(token.expiresAt)) { results.push({ ref, status: "expired" }); continue; }
+      const expectedSig = signTokenEntry(token);
+      if (expectedSig !== token.signature) { results.push({ ref, status: "signature_mismatch" }); continue; }
+      results.push({ ref, status: "valid_offline" });
+    }
+    return res.json({ mode: "offline_json", results });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "server error" });
+  }
+});
+
+
+// 10) Admin export orders as CSV (basic) — add admin auth in production
 app.get("/api/admin/export-orders", async (req, res) => {
   try {
     const orders = await Order.find().lean();
@@ -383,8 +537,7 @@ app.get("/api/admin/export-orders", async (req, res) => {
   }
 });
 
-// ---------- cleanup cron: delete expired tokens/orders ----------
-// runs every minute, deletes orders older than their expiry (or mark expired)
+// ---------- cleanup cron: delete expired tokens & refresh snapshot ----------
 cron.schedule("*/1 * * * *", async () => {
   try {
     const now = new Date();
@@ -392,6 +545,8 @@ cron.schedule("*/1 * * * *", async () => {
     if (resDel.deletedCount > 0) {
       console.log(`Cleanup: removed ${resDel.deletedCount} expired orders/tokens`);
     }
+    // keep the tokens file fresh for hardware pulls
+    await updateTokensFile();
   } catch (err) {
     console.error("cleanup error:", err);
   }
