@@ -318,8 +318,9 @@ app.post("/api/orders", authMiddleware, async (req, res) => {
     });
 
     // QR contains only the public ref JSON
-    const qrPayload = JSON.stringify({ ref: publicRef });
+    const qrPayload = JSON.stringify({ ref: publicRef, token: secretToken });
     const qrDataUrl = await qrcode.toDataURL(qrPayload);
+
 
     // OPTIONAL: refresh snapshot so hardware can pull immediately
     try { await updateTokensFile(); } catch (e) { console.warn("snapshot refresh failed:", e.message); }
