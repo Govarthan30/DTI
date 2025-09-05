@@ -12,6 +12,14 @@ const bcrypt = require("bcrypt");
 const cron = require("node-cron");
 const fs = require("fs");
 const path = require("path");
+const Razorpay = require("razorpay");
+const router = express.Router();
+const offlineFile = path.join(process.cwd(), "offlineClaims.json");
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
 
 const app = express();
 app.use(cors());
@@ -284,89 +292,153 @@ app.post("/api/auth/resend-otp", async (req, res) => {
     return res.status(500).json({ error: "server error" });
   }
 });
+console.log("=== /api/orders route hit ===");
 
 // 5) Create order
-// 5) Create order
 app.post("/api/orders", authMiddleware, async (req, res) => {
+  console.log("=== /api/orders route hit ===");
+  console.log("User (from authMiddleware):", req.user);
+  console.log("Request Body:", req.body);
+
   try {
     const userId = req.user.userId;
     const userEmail = req.user.email;
     const { items } = req.body;
+
+    console.log("=== Validating request body ===");
     if (!items || !Array.isArray(items) || items.length === 0) {
+      console.warn("Invalid request: items array required");
       return res.status(400).json({ error: "items array required" });
     }
 
     const total = items.reduce((s, it) => s + (it.price || 0) * (it.qty || 1), 0);
+    console.log("=== Order total calculated:", total, "===");
 
+    console.log("=== Generating tokens ===");
     const secretToken = genSecret(32);
     let publicRef;
+    let attempts = 0;
+    const maxAttempts = 5;
     do {
       publicRef = genRef(10);
-    } while (await Order.findOne({ publicRef }));
+      attempts++;
+      if (attempts > maxAttempts) {
+        console.error("Failed to generate unique publicRef after", maxAttempts, "attempts");
+        return res.status(500).json({ error: "Failed to generate unique order reference" });
+      }
+    } while (await Order.findOne({ publicRef }).catch(err => {
+       console.error("Error checking for existing publicRef:", err);
+       // If DB check fails, don't proceed
+       throw err;
+    }));
+    console.log("=== Generated unique publicRef:", publicRef, "===");
 
     const expiresAt = nowPlusMinutes(30);
+    console.log("=== Order expires at:", expiresAt.toISOString(), "===");
 
+    console.log("=== Creating order in DB ===");
     const order = await Order.create({
       userId,
       userEmail,
       items,
       total,
-      paid: true,
+      paid: true, // Assuming paid after successful Razorpay verification (adjust if needed pre-payment)
       publicRef,
       secretToken,
       expiresAt,
     });
+    console.log("=== Order created successfully, ID:", order._id, "===");
 
-    // QR contains only the public ref JSON
+    // QR code payload
+    console.log("=== Generating QR Code ===");
     const qrPayload = JSON.stringify({ ref: publicRef, token: secretToken });
     const qrDataUrl = await qrcode.toDataURL(qrPayload);
+    console.log("=== QR Code generated ===");
 
-
-    // OPTIONAL: refresh snapshot so hardware can pull immediately
-    try { await updateTokensFile(); } catch (e) { console.warn("snapshot refresh failed:", e.message); }
-
-    // 📧 Send mail with QR
-    if (MAIL_USER && MAIL_PASS) {
-      const mailOptions = {
-        from: MAIL_USER,
-        to: userEmail,
-        subject: "Your QuickServe Order QR Code",
-        html: `
-          <p>Thank you for your order 🎉</p>
-          <p>Order Ref: <b>${publicRef}</b></p>
-          <p>Total: ₹${total}</p>
-          <p>This QR code is valid until <b>${expiresAt.toLocaleString()}</b></p>
-          <p><img src="cid:orderqr" alt="QR Code" /></p>
-        `,
-        attachments: [
-          {
-            filename: `order-${publicRef}.png`,
-            content: qrDataUrl.split("base64,")[1],
-            encoding: "base64",
-            cid: "orderqr" // embed inline in HTML
-          }
-        ],
-      };
-
-      transporter.sendMail(mailOptions).catch(err => {
-        console.error("QR mail send error:", err.message);
-      });
+    try {
+      console.log("=== Updating tokens snapshot file ===");
+      await updateTokensFile();
+      console.log("=== Tokens snapshot file updated ===");
+    } catch (e) {
+      console.warn("Snapshot refresh failed:", e.message);
     }
 
+
+    // 📧 Send mail with QR
+    console.log("=== Preparing to send QR Email ===");
+    console.log("User Email (userEmail):", userEmail);
+    console.log("MAIL_USER env var set:", !!MAIL_USER);
+    console.log("MAIL_PASS env var set (length check):", MAIL_PASS ? `Yes (${MAIL_PASS.length} chars)` : "No");
+
+    let emailSent = false; // Flag to track email status
+    if (!MAIL_USER || !MAIL_PASS) {
+      console.warn("Mail credentials missing – skipping email.");
+    } else {
+      console.log("=== Attempting to send QR Email ===");
+      try {
+        // Note: transporter.verify() is often not needed on every send if connection is stable.
+        // Uncomment the next two lines if you suspect SMTP connection issues.
+        // await transporter.verify();
+        // console.log("✅ SMTP server verified and ready");
+
+        const mailOptions = {
+          from: MAIL_USER,
+          to: userEmail,
+          subject: "Your QuickServe Order QR Code",
+          html: `
+            <p>Thank you for your order 🎉</p>
+            <p>Order Ref: <b>${publicRef}</b></p>
+            <p>Total: ₹${total}</p>
+            <p>This QR code is valid until <b>${expiresAt.toLocaleString()}</b></p>
+            <p><img src="cid:orderqr" alt="QR Code" /></p>
+          `,
+          attachments: [
+            {
+              filename: `order-${publicRef}.png`,
+              content: qrDataUrl.split("base64,")[1],
+              encoding: "base64",
+              cid: "orderqr" // embed inline in HTML
+            }
+          ],
+        };
+
+        console.log("=== Mail Options Prepared ===");
+        const info = await transporter.sendMail(mailOptions);
+        console.log("📧 QR Mail sent successfully. Message ID:", info.messageId);
+        emailSent = true; // Set flag on success
+
+      } catch (err) {
+        // **** This is the key part for debugging - ensure it logs ****
+        console.error("❌ QR Mail send error:", err);
+        // Depending on requirements, you might want to return an error to the client
+        // if the email is critical. For now, we log and continue.
+      }
+    }
+
+    // Determine final message based on email status
+    const responseMessage = emailSent
+      ? "order created and email sent"
+      : "order created (but email with QR failed to send)";
+
+    console.log("=== Sending final response ===");
     return res.json({
-      message: "order created",
+      message: responseMessage,
       orderId: order._id,
       publicRef,
-      qrDataUrl,
+      qrDataUrl, // Always send back QR data, frontend can use if email failed
       expiresAt,
     });
+
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "server error" });
+    // **** CRITICAL: Make sure this outer catch logs the error ****
+    console.error("=== UNHANDLED ERROR in /api/orders route:", err);
+    // Send a generic error response to the client
+    return res.status(500).json({ error: "Failed to create order. Please try again later." });
   }
 });
 
 
+console.log("=== /api/orders/history route hit ===");
 // 6) Get user's order history
 app.get("/api/orders/history", authMiddleware, async (req, res) => {
   try {
@@ -422,13 +494,14 @@ app.get("/api/hardware/tokens-file", async (req, res) => {
 
 // 9) Hardware redeem (online, strict) — requires secretToken
 // 9) Hardware redeem (hybrid: online DB, fallback to tokens.json)
+// 9) Hardware redeem (hybrid: online DB, fallback to tokens.json)
 app.post("/api/hardware/redeem", async (req, res) => {
   try {
     const { ref, secretToken } = req.body;
     if (!ref) return res.status(400).json({ error: "ref required" });
 
+    // --- Online mode (MongoDB) ---
     try {
-      // --- Online mode (MongoDB) ---
       const tokenDoc = await Order.findOne({ publicRef: ref });
       if (tokenDoc) {
         if (tokenDoc.used) return res.status(409).json({ error: "token already used" });
@@ -436,10 +509,31 @@ app.post("/api/hardware/redeem", async (req, res) => {
         if (!secretToken || secretToken !== tokenDoc.secretToken) {
           return res.status(401).json({ error: "invalid secretToken" });
         }
+
         tokenDoc.used = true;
         await tokenDoc.save();
         try { await updateTokensFile(); } catch (e) {}
-        return res.json({ message: "valid (DB)", order: { id: tokenDoc._id, items: tokenDoc.items, total: tokenDoc.total } });
+
+        // ✅ Send Thank-you mail
+        if (MAIL_USER && MAIL_PASS) {
+          transporter.sendMail({
+            from: MAIL_USER,
+            to: tokenDoc.userEmail,
+            subject: "Thank You for Your Order 🎉",
+            html: `
+              <p>Hi ${tokenDoc.userEmail},</p>
+              <p>Thank you for claiming your order. We hope you enjoy it!</p>
+              <p><b>Order Ref:</b> ${tokenDoc.publicRef}</p>
+              <p><b>Total:</b> ₹${tokenDoc.total}</p>
+              <p>— QuickServe Team</p>
+            `,
+          }).catch(err => console.error("Thank-you mail error:", err));
+        }
+
+        return res.json({
+          message: "valid (DB)",
+          order: { id: tokenDoc._id, items: tokenDoc.items, total: tokenDoc.total }
+        });
       }
     } catch (dbErr) {
       console.warn("⚠️ DB offline, falling back to JSON:", dbErr.message);
@@ -457,6 +551,22 @@ app.post("/api/hardware/redeem", async (req, res) => {
     const expectedSig = signTokenEntry(token);
     if (expectedSig !== token.signature) return res.status(401).json({ error: "signature mismatch" });
 
+    // ✅ Send Thank-you mail (offline mode)
+    if (MAIL_USER && MAIL_PASS) {
+      transporter.sendMail({
+        from: MAIL_USER,
+        to: token.userEmail,
+        subject: "Thank You for Your Order 🎉",
+        html: `
+          <p>Hi ${token.userEmail},</p>
+          <p>Thank you for claiming your order. We hope you enjoy it!</p>
+          <p><b>Order Ref:</b> ${token.publicRef}</p>
+          <p><b>Total:</b> ₹${token.total}</p>
+          <p>— QuickServe Team</p>
+        `,
+      }).catch(err => console.error("Thank-you mail error:", err));
+    }
+
     return res.json({ message: "valid (offline json)", token });
   } catch (err) {
     console.error(err);
@@ -467,51 +577,56 @@ app.post("/api/hardware/redeem", async (req, res) => {
 // 9b) Hardware bulk-redeem (OFFLINE SYNC) — trusts hardware key
 // Body: { refs: ["ABC123", "XYZ999", ...] }
 // 9b) Hardware bulk-redeem (hybrid: online DB, fallback to tokens.json)
+// Path to store offline claims
+const OFFLINE_CLAIMS_PATH = path.join(__dirname, "offlineClaims.json");
+
 app.post("/api/hardware/bulk-redeem", async (req, res) => {
   try {
     if (!requireHardwareKey(req, res)) return;
-    const { refs } = req.body;
-    if (!Array.isArray(refs) || refs.length === 0) {
-      return res.status(400).json({ error: "refs[] required" });
+
+    // --- Check if offline claims exist ---
+    if (!fs.existsSync(OFFLINE_CLAIMS_PATH)) {
+      return res.status(400).json({ error: "no offline claims to sync" });
+    }
+    const offlineClaims = JSON.parse(fs.readFileSync(OFFLINE_CLAIMS_PATH, "utf8"));
+    if (!Array.isArray(offlineClaims) || offlineClaims.length === 0) {
+      return res.status(400).json({ error: "no offline claims pending" });
     }
 
     const results = [];
+
     try {
-      // --- Online mode ---
-      for (const ref of refs) {
+      // --- Sync each offline claim into DB ---
+      for (const claim of offlineClaims) {
+        const ref = claim.ref;
         const doc = await Order.findOne({ publicRef: ref });
         if (!doc) { results.push({ ref, status: "not_found" }); continue; }
         if (doc.used) { results.push({ ref, status: "already_used" }); continue; }
         if (new Date() > doc.expiresAt) { results.push({ ref, status: "expired" }); continue; }
+
+        // Mark redeemed
         doc.used = true;
         await doc.save();
-        results.push({ ref, status: "marked_used" });
+        results.push({ ref, status: "synced" });
       }
-      try { await updateTokensFile(); } catch (e) {}
-      return res.json({ mode: "db", results });
-    } catch (dbErr) {
-      console.warn("⚠️ DB offline, bulk fallback to JSON:", dbErr.message);
-    }
 
-    // --- Offline mode ---
-    if (!fs.existsSync(TOKENS_FILE_PATH)) {
-      return res.status(503).json({ error: "offline snapshot not available" });
+      // ✅ Clear offline claims after syncing
+      fs.writeFileSync(OFFLINE_CLAIMS_PATH, JSON.stringify([], null, 2));
+
+      // Update tokens.json snapshot
+      try { await updateTokensFile(); } catch (e) { console.warn("snapshot update failed:", e.message); }
+
+      return res.json({ mode: "synced_to_db", results });
+    } catch (dbErr) {
+      console.error("❌ Bulk sync failed, DB offline:", dbErr.message);
+      return res.status(503).json({ error: "DB unavailable, try again later" });
     }
-    const snapshot = JSON.parse(fs.readFileSync(TOKENS_FILE_PATH));
-    for (const ref of refs) {
-      const token = snapshot.tokens.find(t => t.publicRef === ref);
-      if (!token) { results.push({ ref, status: "not_found" }); continue; }
-      if (new Date() > new Date(token.expiresAt)) { results.push({ ref, status: "expired" }); continue; }
-      const expectedSig = signTokenEntry(token);
-      if (expectedSig !== token.signature) { results.push({ ref, status: "signature_mismatch" }); continue; }
-      results.push({ ref, status: "valid_offline" });
-    }
-    return res.json({ mode: "offline_json", results });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "server error" });
   }
 });
+
 
 
 // 10) Admin export orders as CSV (basic) — add admin auth in production
@@ -537,6 +652,213 @@ app.get("/api/admin/export-orders", async (req, res) => {
     return res.status(500).json({ error: "server error" });
   }
 });
+
+// 1) Create Razorpay Order
+app.post("/api/payments/create-order", authMiddleware, async (req, res) => {
+  try {
+    const { amount } = req.body; // in INR (not paise)
+    if (!amount) return res.status(400).json({ error: "amount required" });
+
+    const options = {
+      amount: amount * 100, // Razorpay works in paise
+      currency: "INR",
+      receipt: "receipt_" + Date.now(),
+    };
+
+    const order = await razorpay.orders.create(options);
+    return res.json(order);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to create Razorpay order" });
+  }
+});
+
+// 2) Verify Razorpay Payment
+app.post("/api/payments/verify", authMiddleware, async (req, res) => {
+  console.log("=== /api/payments/verify route hit ===");
+  console.log("User (from authMiddleware):", req.user);
+  console.log("Request Body:", req.body);
+
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, items } = req.body;
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      console.warn("Missing payment details in request body");
+      return res.status(400).json({ error: "Missing payment details" });
+    }
+
+    // --- Signature Verification ---
+    console.log("=== Verifying Razorpay signature ===");
+    const expectedSig = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(razorpay_order_id + "|" + razorpay_payment_id)
+      .digest("hex");
+
+    if (expectedSig !== razorpay_signature) {
+      console.warn("Invalid Razorpay signature provided");
+      return res.status(400).json({ error: "Invalid signature" });
+    }
+    console.log("✅ Razorpay signature verified successfully");
+
+    // --- Order Data Processing ---
+    console.log("=== Processing order data ===");
+    const total = items.reduce((s, it) => s + (it.price || 0) * (it.qty || 1), 0);
+    console.log("Calculated total:", total);
+
+    const secretToken = genSecret(32);
+    let publicRef;
+    let attempts = 0;
+    const maxAttempts = 5;
+    do {
+      publicRef = genRef(10);
+      attempts++;
+      if (attempts > maxAttempts) {
+        const errorMsg = `Failed to generate unique publicRef after ${maxAttempts} attempts`;
+        console.error(errorMsg);
+        return res.status(500).json({ error: errorMsg });
+      }
+    } while (await Order.findOne({ publicRef }).catch(err => {
+       console.error("Error checking for existing publicRef:", err);
+       throw err; // Re-throw to be caught by the outer catch
+    }));
+    console.log("Generated unique publicRef:", publicRef);
+
+    const expiresAt = nowPlusMinutes(30);
+    console.log("Order expires at:", expiresAt.toISOString());
+
+    // --- Database Order Creation ---
+    console.log("=== Creating order in DB ===");
+    const order = await Order.create({
+      userId: req.user.userId,
+      userEmail: req.user.email,
+      items,
+      total,
+      paid: true,
+      publicRef,
+      secretToken,
+      expiresAt,
+    });
+    console.log("=== Order created successfully, ID:", order._id, "===");
+
+    // --- QR Code Generation ---
+    console.log("=== Generating QR Code ===");
+    const qrPayload = JSON.stringify({ ref: publicRef, token: secretToken });
+    const qrDataUrl = await qrcode.toDataURL(qrPayload);
+    console.log("=== QR Code generated ===");
+
+    // --- Update Tokens File ---
+    try {
+      console.log("=== Updating tokens snapshot file ===");
+      await updateTokensFile();
+      console.log("=== Tokens snapshot file updated ===");
+    } catch (e) {
+      console.warn("Snapshot refresh failed:", e.message);
+    }
+
+    // --- 📧 Send Mail with QR ---
+    console.log("=== Preparing to send QR Email ===");
+    const userEmail = req.user.email; // Get email from authenticated user
+    console.log("User Email (userEmail):", userEmail);
+    console.log("MAIL_USER env var set:", !!MAIL_USER);
+    console.log("MAIL_PASS env var set (length check):", MAIL_PASS ? `Yes (${MAIL_PASS.length} chars)` : "No");
+
+    let emailSent = false;
+    if (!MAIL_USER || !MAIL_PASS) {
+      console.warn("Mail credentials missing – skipping email.");
+    } else {
+      console.log("=== Attempting to send QR Email ===");
+      try {
+        // await transporter.verify(); // Uncomment if needed for debugging
+        // console.log("✅ SMTP server verified and ready");
+
+        const mailOptions = {
+          from: MAIL_USER,
+          to: userEmail,
+          subject: "Your QuickServe Order QR Code",
+          html: `
+            <p>Thank you for your order 🎉</p>
+            <p>Order Ref: <b>${publicRef}</b></p>
+            <p>Total: ₹${total}</p>
+            <p>This QR code is valid until <b>${expiresAt.toLocaleString()}</b></p>
+            <p><img src="cid:orderqr" alt="QR Code" /></p>
+          `,
+          attachments: [
+            {
+              filename: `order-${publicRef}.png`,
+              content: qrDataUrl.split("base64,")[1],
+              encoding: "base64",
+              cid: "orderqr"
+            }
+          ],
+        };
+
+        console.log("=== Mail Options Prepared ===");
+        const info = await transporter.sendMail(mailOptions);
+        console.log("📧 QR Mail sent successfully. Message ID:", info.messageId);
+        emailSent = true;
+
+      } catch (err) {
+        console.error("❌ QR Mail send error:", err);
+        // Depending on your requirements, you might want to return an error to the client
+        // if the email is critical. For now, we log the error and continue.
+        // The order is created, just the email failed.
+      }
+    }
+
+    const responseMessage = emailSent
+      ? "Order created and email sent successfully"
+      : "Order created successfully (but email failed to send)";
+
+    console.log("=== Sending final response ===");
+    // --- Send Response ---
+    return res.json({
+      message: responseMessage, // Include email status in response
+      success: true,
+      orderId: order._id,
+      publicRef,
+      qrDataUrl,
+      expiresAt,
+    });
+
+  } catch (err) {
+    console.error("=== UNHANDLED ERROR in /api/payments/verify route:", err);
+    return res.status(500).json({ error: "Payment verification and order creation failed" });
+  }
+});
+
+// 1) Offline Redeem
+app.post("/api/hardware/offline-redeem", async (req, res) => {
+  try {
+    const { userId, hardwareId, credits } = req.body;
+
+    if (!userId || !hardwareId || !credits) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    // Read existing offline claims
+    const claims = JSON.parse(fs.readFileSync("offlineClaims.json", "utf-8") || "[]");
+
+    // Add new claim
+    claims.push({
+      userId,
+      hardwareId,
+      credits,
+      claimedAt: new Date().toISOString(),
+    });
+
+    // Save back to file
+    fs.writeFileSync("offlineClaims.json", JSON.stringify(claims, null, 2));
+
+    return res.json({
+      success: true,
+      message: "Claim stored offline. Will sync when online.",
+    });
+  } catch (error) {
+    console.error("Offline Redeem Error:", error);
+    return res.status(500).json({ error: "Failed to store offline claim" });
+  }
+});
+
 
 // ---------- cleanup cron: delete expired tokens & refresh snapshot ----------
 cron.schedule("*/1 * * * *", async () => {
