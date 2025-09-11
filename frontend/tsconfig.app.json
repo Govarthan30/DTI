@@ -7,21 +7,26 @@
     "module": "ESNext",
     "skipLibCheck": true,
 
-    /* Bundler mode */
+    /* Bundler mode (for Vite, modern bundlers) */
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "moduleDetection": "force",
     "noEmit": true,
-    "jsx": "react-jsx",
 
-    /* Linting */
+    /* React JSX Transform */
+    "jsx": "react-jsx",
+    "types": ["react", "react-dom"],
+
+    /* Linting & Strictness */
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true,
-    "noUncheckedSideEffectImports": true
+    "noUncheckedSideEffectImports": true,
+
+    /* Optional: lets TS ignore unused vars if prefixed with _ */
+    "allowUnusedLabels": false
   },
   "include": ["src"]
 }
